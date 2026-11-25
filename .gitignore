@@ -1,0 +1,20 @@
+# build / experiment artefacts
+work/
+_ref/
+*.db
+*.fdata
+*.inst
+*.o
+*.bolt
+*.orig
+*.hdr
+*.log
+
+# editor / OS
+.vscode/
+.DS_Store
+Thumbs.db
+__pycache__/
+
+# local notes
+.workbuddy/

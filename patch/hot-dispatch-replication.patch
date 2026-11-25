@@ -1,0 +1,467 @@
+diff --git a/bolt/include/bolt/Passes/ReplicateHotDispatch.h b/bolt/include/bolt/Passes/ReplicateHotDispatch.h
+new file mode 100644
+index 000000000..be5f7b77f
+--- /dev/null
++++ b/bolt/include/bolt/Passes/ReplicateHotDispatch.h
+@@ -0,0 +1,58 @@
++//===- bolt/Passes/ReplicateHotDispatch.h ------------------------*- C++ -*-==//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++//
++// Replicate a small, very hot "dispatch" block (a block ending with an
++// indirect jump through a jump table, i.e. the head of a switch/interpreter
++// dispatch loop) at its hottest unconditional predecessors.
++//
++// Motivation: a block can only fall through from one predecessor.  In a
++// dispatch loop the dispatch block D has hundreds of predecessors (one per
++// case body), therefore every case body except the one laid out right before D
++// has to end with a taken `jmp D`.  Replicating D right after a hot case body
++// turns that taken jump into a fall-through.
++//
++//===----------------------------------------------------------------------===//
++
++#ifndef BOLT_PASSES_REPLICATE_HOT_DISPATCH_H
++#define BOLT_PASSES_REPLICATE_HOT_DISPATCH_H
++
++#include "bolt/Passes/BinaryPasses.h"
++
++namespace llvm {
++namespace bolt {
++
++class ReplicateHotDispatch : public BinaryFunctionPass {
++  /// Number of functions whose layout was changed.
++  uint64_t ModifiedFunctions{0};
++  /// Number of replicated basic blocks.
++  uint64_t ReplicatedBlocks{0};
++  /// Number of bytes added by the replication.
++  uint64_t ReplicatedBytes{0};
++  /// Dynamic count of the taken branches removed by the replication.
++  uint64_t RemovedTakenBranches{0};
++
++  /// Return true if \p BB ends with an indirect jump through a jump table
++  /// and does not contain any call (i.e. it can be part of a dispatch chain).
++  bool isDispatchTail(const BinaryBasicBlock &BB) const;
++
++public:
++  explicit ReplicateHotDispatch(const cl::opt<bool> &PrintPass)
++      : BinaryFunctionPass(PrintPass) {}
++
++  const char *getName() const override { return "replicate-hot-dispatch"; }
++
++  bool runOnFunction(BinaryFunction &BF);
++
++  /// Pass entry point.
++  Error runOnFunctions(BinaryContext &BC) override;
++};
++
++} // namespace bolt
++} // namespace llvm
++
++#endif
+diff --git a/bolt/lib/Passes/CMakeLists.txt b/bolt/lib/Passes/CMakeLists.txt
+old mode 100644
+new mode 100755
+index a7514d4be..0b82a1225
+--- a/bolt/lib/Passes/CMakeLists.txt
++++ b/bolt/lib/Passes/CMakeLists.txt
+@@ -33,6 +33,7 @@ add_llvm_library(LLVMBOLTPasses
+   ProfileQualityStats.cpp
+   RegAnalysis.cpp
+   RegReAssign.cpp
++  ReplicateHotDispatch.cpp
+   RISCVLongJmpPass.cpp
+   ReorderAlgorithm.cpp
+   ReorderFunctions.cpp
+diff --git a/bolt/lib/Passes/ReplicateHotDispatch.cpp b/bolt/lib/Passes/ReplicateHotDispatch.cpp
+new file mode 100644
+index 000000000..54433d186
+--- /dev/null
++++ b/bolt/lib/Passes/ReplicateHotDispatch.cpp
+@@ -0,0 +1,343 @@
++//===- bolt/Passes/ReplicateHotDispatch.cpp -------------------------------===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++//
++// This file implements the ReplicateHotDispatch pass.
++//
++//===----------------------------------------------------------------------===//
++
++#include "bolt/Passes/ReplicateHotDispatch.h"
++#include "bolt/Core/ParallelUtilities.h"
++
++#define DEBUG_TYPE "bolt-replicate-hot-dispatch"
++
++using namespace llvm;
++
++namespace opts {
++extern cl::OptionCategory BoltOptCategory;
++extern cl::opt<bool> NoThreads;
++
++static cl::opt<bool> ReplicateHotDispatchOpt(
++    "replicate-hot-dispatch",
++    cl::desc("replicate small hot dispatch blocks at their hot predecessors "
++             "to convert taken jumps into fall-throughs"),
++    cl::init(false), cl::cat(BoltOptCategory));
++
++static cl::opt<unsigned> ReplicateMinFanIn(
++    "replicate-hot-dispatch-min-fanin",
++    cl::desc("minimum number of predecessors of the dispatch head block"),
++    cl::init(8), cl::cat(BoltOptCategory), cl::ReallyHidden);
++
++static cl::opt<unsigned> ReplicateMinBlockExecCount(
++    "replicate-hot-dispatch-min-exec-count",
++    cl::desc("minimum execution count of the dispatch block"),
++    cl::init(100000), cl::cat(BoltOptCategory), cl::ReallyHidden);
++
++static cl::opt<unsigned> ReplicateMinEdgeCount(
++    "replicate-hot-dispatch-min-edge-count",
++    cl::desc("minimum execution count of the replicated edge"),
++    cl::init(10000), cl::cat(BoltOptCategory), cl::ReallyHidden);
++
++static cl::opt<unsigned> ReplicateMaxChainBytes(
++    "replicate-hot-dispatch-max-chain-bytes",
++    cl::desc("maximum size (in bytes) of a replicated dispatch chain"),
++    cl::init(48), cl::cat(BoltOptCategory), cl::ReallyHidden);
++
++static cl::opt<unsigned> ReplicateMaxCopies(
++    "replicate-hot-dispatch-max-copies",
++    cl::desc("maximum number of replicated dispatch chains per function"),
++    cl::init(8), cl::cat(BoltOptCategory), cl::ReallyHidden);
++
++static cl::opt<unsigned> ReplicateMaxBytes(
++    "replicate-hot-dispatch-max-bytes",
++    cl::desc("maximum number of bytes added per function"),
++    cl::init(512), cl::cat(BoltOptCategory), cl::ReallyHidden);
++
++static cl::opt<bool> ReplicateDumpCandidates(
++    "replicate-hot-dispatch-dump",
++    cl::desc("dump candidate blocks and their properties"),
++    cl::init(false), cl::cat(BoltOptCategory), cl::ReallyHidden);
++} // namespace opts
++
++namespace llvm {
++namespace bolt {
++
++bool ReplicateHotDispatch::isDispatchTail(const BinaryBasicBlock &BB) const {
++  if (BB.empty() || BB.isLandingPad())
++    return false;
++
++  const BinaryContext &BC = BB.getFunction()->getBinaryContext();
++
++  const MCInst *Terminator = BB.getLastNonPseudoInstr();
++  if (!Terminator || !BC.MIB->isIndirectBranch(*Terminator))
++    return false;
++
++  if (BC.MIB->getJumpTable(*Terminator) == 0)
++    return false;
++
++  for (const MCInst &Inst : BB)
++    if (BC.MIB->isCall(Inst))
++      return false;
++
++  return true;
++}
++
++bool ReplicateHotDispatch::runOnFunction(BinaryFunction &BF) {
++  BinaryContext &BC = BF.getBinaryContext();
++
++  BinaryContext::IndependentCodeEmitter Emitter;
++  if (!opts::NoThreads)
++    Emitter = BC.createIndependentMCCodeEmitter();
++  const MCCodeEmitter *MCE = Emitter.MCE.get();
++
++  if (!BF.hasValidProfile() || !BF.isSimple())
++    return false;
++
++  if (BF.getLayout().block_size() < 3)
++    return false;
++
++  BF.getLayout().updateLayoutIndices();
++
++  // New blocks are added below, so iterate over a snapshot of the layout.
++  std::vector<BinaryBasicBlock *> Blocks(BF.getLayout().block_begin(),
++                                         BF.getLayout().block_end());
++
++  // A "dispatch chain" is a sequence of blocks
++  //     Head -> ... -> Tail
++  // where Tail ends with an indirect jump through a jump table and every block
++  // on the chain has exactly one successor.  Head is the entry of the chain and
++  // is the block with a high fan-in (the loop header of a dispatch loop in the
++  // common case).  Replicating the whole chain makes Pred -> Head a
++  // fall-through.
++  struct ChainInfo {
++    std::vector<BinaryBasicBlock *> Blocks;
++    uint64_t Bytes = 0;
++  };
++
++  auto buildChain = [&](BinaryBasicBlock *Tail) -> ChainInfo {
++    ChainInfo Info;
++    std::vector<BinaryBasicBlock *> Rev;
++    BinaryBasicBlock *Cur = Tail;
++    while (true) {
++      if (!Cur->isValid() || Cur->isLandingPad())
++        break;
++      Rev.push_back(Cur);
++      if (Rev.size() > 8)
++        break;
++      // Stop extending the chain as soon as the current entry has a high
++      // fan-in: replicating further up would duplicate code that is not
++      // required to reach the indirect jump.
++      if (Cur->pred_size() >= opts::ReplicateMinFanIn)
++        break;
++      if (Cur->pred_size() != 1)
++        break;
++      BinaryBasicBlock *Pred = *Cur->pred_begin();
++      if (Pred == Cur)
++        break;
++      // The predecessor may also branch to a second block (the bounds check of
++      // a switch, for example); only the edge Pred -> Cur is re-targeted.
++      if (Pred->succ_size() > 2)
++        break;
++      if (llvm::find(Pred->successors(), Cur) == Pred->succ_end())
++        break;
++      if (Pred->getFragmentNum() != Cur->getFragmentNum())
++        break;
++      // Do not walk through blocks that are themselves dispatch tails or that
++      // contain calls.
++      if (isDispatchTail(*Pred))
++        break;
++      bool HasCall = false;
++      for (const MCInst &Inst : *Pred)
++        if (BC.MIB->isCall(Inst))
++          HasCall = true;
++      if (HasCall)
++        break;
++      Cur = Pred;
++    }
++    // Rev is Tail..Head; store Head..Tail.
++    Info.Blocks.assign(Rev.rbegin(), Rev.rend());
++    for (BinaryBasicBlock *BB : Info.Blocks)
++      Info.Bytes += BB->estimateSize(MCE);
++    return Info;
++  };
++
++  struct Candidate {
++    BinaryBasicBlock *Pred;
++    uint64_t Count;
++  };
++
++  bool Modified = false;
++  unsigned CopiesInFunction = 0;
++  uint64_t BytesInFunction = 0;
++
++  for (BinaryBasicBlock *Tail : Blocks) {
++    if (CopiesInFunction >= opts::ReplicateMaxCopies)
++      break;
++
++    if (!Tail->isValid() || !isDispatchTail(*Tail))
++      continue;
++
++    if (opts::ReplicateDumpCandidates) {
++      const ChainInfo DBG = buildChain(Tail);
++      BC.outs() << "HDR-TAIL " << BF.getPrintName() << " BB#"
++                << Tail->getIndex() << " count="
++                << Tail->getKnownExecutionCount() << " chainlen="
++                << DBG.Blocks.size() << " chainbytes=" << DBG.Bytes
++                << " headfanin="
++                << (DBG.Blocks.empty() ? 0 : DBG.Blocks.front()->pred_size())
++                << "\n";
++    }
++
++    if (Tail->getKnownExecutionCount() < opts::ReplicateMinBlockExecCount)
++      continue;
++
++    const ChainInfo Chain = buildChain(Tail);
++    if (Chain.Blocks.empty() || Chain.Bytes > opts::ReplicateMaxChainBytes)
++      continue;
++
++    BinaryBasicBlock *Head = Chain.Blocks.front();
++    if (Head->pred_size() < opts::ReplicateMinFanIn)
++      continue;
++    if (Head->getKnownExecutionCount() < opts::ReplicateMinBlockExecCount)
++      continue;
++
++    if (opts::ReplicateDumpCandidates) {
++      BC.outs() << "HDR-CHAIN " << BF.getPrintName() << " head=BB#"
++                << Head->getIndex() << " len=" << Chain.Blocks.size()
++                << " bytes=" << Chain.Bytes << " fanin=" << Head->pred_size()
++                << " count=" << Head->getKnownExecutionCount() << "\n";
++    }
++
++    // Collect hot unconditional predecessors of the chain head.
++    std::vector<Candidate> Candidates;
++    for (BinaryBasicBlock *Pred : Head->predecessors()) {
++      if (Pred == Head || Pred->succ_size() != 1)
++        continue;
++      if (Pred->isLandingPad() || Pred->isCold())
++        continue;
++      if (Pred->getFragmentNum() != Head->getFragmentNum())
++        continue;
++
++      const MCInst *PredTerminator = Pred->getLastNonPseudoInstr();
++      if (!PredTerminator || !BC.MIB->isUnconditionalBranch(*PredTerminator))
++        continue;
++
++      const uint64_t Count = Pred->getBranchInfo(*Head).Count;
++      if (Count < opts::ReplicateMinEdgeCount)
++        continue;
++
++      Candidates.push_back({Pred, Count});
++    }
++
++    if (Candidates.empty())
++      continue;
++
++    llvm::sort(Candidates, [](const Candidate &A, const Candidate &B) {
++      return A.Count > B.Count;
++    });
++
++    for (const Candidate &C : Candidates) {
++      if (CopiesInFunction >= opts::ReplicateMaxCopies)
++        break;
++      if (BytesInFunction + Chain.Bytes > opts::ReplicateMaxBytes)
++        break;
++
++      BinaryBasicBlock *Pred = C.Pred;
++
++      // Nothing to gain if the predecessor already falls through into Head.
++      if (Pred->getLayoutIndex() + 1 == Head->getLayoutIndex())
++        continue;
++
++      const uint64_t EdgeCount = C.Count;
++      const uint64_t EdgeMispreds = Pred->getBranchInfo(*Head).MispredictedCount;
++
++      // Create one replica per block of the chain.
++      std::vector<std::unique_ptr<BinaryBasicBlock>> Replicas;
++      std::vector<BinaryBasicBlock *> ReplicaPtrs;
++      for (BinaryBasicBlock *Orig : Chain.Blocks) {
++        std::unique_ptr<BinaryBasicBlock> Replica = BF.createBasicBlock();
++        BinaryBasicBlock *ReplicaPtr = Replica.get();
++        Replica->addInstructions(Orig->begin(), Orig->end());
++        Replica->setExecutionCount(EdgeCount);
++        Replica->setIsCold(Orig->isCold());
++        for (BinaryBasicBlock *Succ : Orig->successors()) {
++          const BinaryBasicBlock::BinaryBranchInfo &BI =
++              Orig->getBranchInfo(*Succ);
++          Replica->addSuccessor(Succ, BI.Count, BI.MispredictedCount);
++        }
++        ReplicaPtrs.push_back(ReplicaPtr);
++        Replicas.push_back(std::move(Replica));
++      }
++
++      // Place the replicas right after the predecessor, in chain order.
++      BF.insertBasicBlocks(Pred, std::move(Replicas));
++
++      // Redirect Pred -> Head to Pred -> Head'.
++      Pred->removeSuccessor(Head);
++      Pred->addSuccessor(ReplicaPtrs.front(), EdgeCount, EdgeMispreds);
++
++      // Re-target the internal edges of the replicas to the replicas.
++      for (size_t I = 0; I + 1 < ReplicaPtrs.size(); ++I) {
++        BinaryBasicBlock *OrigNext = Chain.Blocks[I + 1];
++        BinaryBasicBlock *RepNext = ReplicaPtrs[I + 1];
++        const auto &BI = Chain.Blocks[I]->getBranchInfo(*OrigNext);
++        const uint64_t SuccCount = BI.Count;
++        const uint64_t SuccMispreds = BI.MispredictedCount;
++        ReplicaPtrs[I]->removeSuccessor(OrigNext);
++        ReplicaPtrs[I]->addSuccessor(RepNext, SuccCount, SuccMispreds);
++      }
++
++      // Account for the executions moved to the replicas.
++      for (BinaryBasicBlock *Orig : Chain.Blocks) {
++        const uint64_t OrigCount = Orig->getKnownExecutionCount();
++        Orig->setExecutionCount(OrigCount > EdgeCount ? OrigCount - EdgeCount
++                                                      : 0);
++      }
++
++      BytesInFunction += Chain.Bytes;
++      ++CopiesInFunction;
++      ReplicatedBlocks += Chain.Blocks.size();
++      ReplicatedBytes += Chain.Bytes;
++      RemovedTakenBranches += EdgeCount;
++      Modified = true;
++    }
++  }
++
++  if (Modified) {
++    ModifiedFunctions++;
++    BF.getLayout().updateLayoutIndices();
++  }
++
++  return Modified;
++}
++
++Error ReplicateHotDispatch::runOnFunctions(BinaryContext &BC) {
++  if (!opts::ReplicateHotDispatchOpt)
++    return Error::success();
++
++  ParallelUtilities::WorkFuncTy WorkFun = [&](BinaryFunction &BF) {
++    runOnFunction(BF);
++  };
++
++  ParallelUtilities::PredicateTy SkipFunc = [&](const BinaryFunction &BF) {
++    return !shouldOptimize(BF);
++  };
++
++  ParallelUtilities::runOnEachFunction(
++      BC, ParallelUtilities::SchedulingPolicy::SP_TRIVIAL, WorkFun, SkipFunc,
++      "ReplicateHotDispatch");
++
++  BC.outs() << "BOLT-INFO: replicate-hot-dispatch: replicated "
++            << ReplicatedBlocks << " blocks in " << ModifiedFunctions
++            << " functions, added " << ReplicatedBytes << " bytes, removed "
++            << RemovedTakenBranches
++            << " dynamically executed taken branches\n";
++  return Error::success();
++}
++
++} // namespace bolt
++} // namespace llvm
+diff --git a/bolt/lib/Rewrite/BinaryPassManager.cpp b/bolt/lib/Rewrite/BinaryPassManager.cpp
+old mode 100644
+new mode 100755
+index 18c84468b..1e78b1538
+--- a/bolt/lib/Rewrite/BinaryPassManager.cpp
++++ b/bolt/lib/Rewrite/BinaryPassManager.cpp
+@@ -31,6 +31,7 @@
+ #include "bolt/Passes/ProfileQualityStats.h"
+ #include "bolt/Passes/RISCVLongJmpPass.h"
+ #include "bolt/Passes/RegReAssign.h"
++#include "bolt/Passes/ReplicateHotDispatch.h"
+ #include "bolt/Passes/ReorderData.h"
+ #include "bolt/Passes/ReorderFunctions.h"
+ #include "bolt/Passes/RetpolineInsertion.h"
+@@ -188,6 +189,11 @@ static cl::opt<bool>
+                             cl::desc("print functions after clustering"),
+                             cl::Hidden, cl::cat(BoltOptCategory));
+ 
++static cl::opt<bool> PrintReplicateHotDispatch(
++    "print-replicate-hot-dispatch",
++    cl::desc("print functions after hot dispatch replication"), cl::Hidden,
++    cl::cat(BoltOptCategory));
++
+ static cl::opt<bool> PrintRetpolineInsertion(
+     "print-retpoline-insertion",
+     cl::desc("print functions after retpoline insertion pass"), cl::Hidden,
+@@ -465,6 +471,13 @@ Error BinaryFunctionPassManager::runAllPasses(BinaryContext &BC) {
+ 
+   Manager.registerPass(std::make_unique<ReorderBasicBlocks>(PrintReordered));
+ 
++  // Replicate small hot dispatch blocks at their hot predecessors. This runs
++  // right after block reordering so that the replicas can be laid out
++  // immediately after their predecessor (guaranteeing a fall-through) instead
++  // of relying on yet another reordering round.
++  Manager.registerPass(
++      std::make_unique<ReplicateHotDispatch>(PrintReplicateHotDispatch));
++
+   Manager.registerPass(std::make_unique<EliminateUnreachableBlocks>(PrintUCE),
+                        opts::EliminateUnreachable);
+ 
